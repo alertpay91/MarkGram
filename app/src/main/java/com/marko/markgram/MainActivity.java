@@ -101,11 +101,6 @@ public class MainActivity extends Activity {
 
     private void handleIntent(Intent intent) {
         if (intent == null) return;
-        String debug = intent.getStringExtra("debug");
-        if (debug != null) { // TEMP: development only, remove before release
-            App.debug(debug);
-            return;
-        }
         String url = null;
         if (Intent.ACTION_VIEW.equals(intent.getAction()) && intent.getData() != null) {
             url = intent.getDataString();
@@ -123,14 +118,16 @@ public class MainActivity extends Activity {
     // ---- Back button: fullscreen -> page history -> home feed -> leave the app ----
 
     private void handleBack() {
+        // Like the app: back on the home feed leaves (instead of walking back through every tab
+        // you visited); everywhere else it goes back one page.
         if (fullScreen) {
             session.exitFullScreen();
+        } else if (isHome(url)) {
+            moveTaskToBack(true);
         } else if (canGoBack) {
             session.goBack();
-        } else if (!isHome(url)) {
-            session.loadUri(App.HOME);
         } else {
-            moveTaskToBack(true);
+            session.loadUri(App.HOME);
         }
     }
 
@@ -222,7 +219,6 @@ public class MainActivity extends Activity {
         public void onLocationChange(GeckoSession s, String url, List<ContentPermission> perms,
                                      Boolean hasUserGesture) {
             if (url != null) MainActivity.this.url = url;
-            Log.i(App.TAG, "location " + url);
         }
 
         @Override
