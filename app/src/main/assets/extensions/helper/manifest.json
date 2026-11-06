@@ -1,0 +1,12 @@
+{
+  "manifest_version": 2,
+  "name": "MarkGram helper",
+  "version": "1.0",
+  "browser_specific_settings": { "gecko": { "id": "helper@markgram.marko" } },
+  "permissions": ["nativeMessaging", "nativeMessagingFromContent", "geckoViewAddons"],
+  "content_scripts": [{
+    "matches": ["*://www.instagram.com/*", "*://instagram.com/*", "*://m.instagram.com/*"],
+    "js": ["helper.js"],
+    "run_at": "document_idle"
+  }]
+}
