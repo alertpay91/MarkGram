@@ -54,17 +54,37 @@
     }
     return best;
   };
-  // The feed is virtualised and reserves space for posts by their measured height. A post with
-  // display:none is never measured (it would leave a growing hole and stop loading), so hidden
-  // posts collapse to 1px instead, which Instagram measures normally.
+  // The feed is virtualised: Instagram measures every post as it is inserted and positions the
+  // rest from those heights. Shrinking a post it has already measured makes it re-correct the
+  // scroll position, which threw fast scrolling back by several posts. So a post is collapsed
+  // only while it is still below the screen (nothing you see moves); one that is already on or
+  // above the screen keeps its size and is only blanked out.
   const hideStyle = document.createElement("style");
-  hideStyle.textContent = "[data-mg-hidden]{height:1px!important;min-height:0!important;max-height:1px!important;"
+  hideStyle.textContent =
+    "[data-mg-hidden=collapsed]{height:1px!important;min-height:0!important;max-height:1px!important;"
     + "margin:0!important;padding:0!important;border:0!important;overflow:hidden!important;opacity:0!important;"
-    + "pointer-events:none!important}";
+    + "pointer-events:none!important}"
+    + "[data-mg-hidden=masked]{visibility:hidden!important;pointer-events:none!important}"
+    // Ads and the "Suggestions for you" carousel are recognised by their links, so a stylesheet
+    // collapses them before Instagram even measures them: no jumping at all.
+    + "article:has(a[href*='facebook.com/ads/']),article:has(a[href*='a_mpk=']),"
+    + "div[style*='flex-direction: column'] > div:has(a[href='/explore/people/']):not(:has(article))"
+    + "{height:1px!important;min-height:0!important;max-height:1px!important;margin:0!important;padding:0!important;"
+    + "border:0!important;overflow:hidden!important;opacity:0!important;pointer-events:none!important}";
   (document.head || document.documentElement).appendChild(hideStyle);
+  /** Suggested posts: collapsed only while at least a screen below view, otherwise left alone. */
+  const hideLater = (el, why) => {
+    if (!el || el.dataset.mgHidden || window.__mgOff) return;
+    if (el.getBoundingClientRect().top >= innerHeight * 2) {
+      el.dataset.mgWhy = why;
+      el.dataset.mgHidden = "collapsed";
+    }
+  };
   const hide = (el, why) => {
-    if (!el || el.dataset.mgHidden) return;
-    el.dataset.mgHidden = why;
+    if (!el || el.dataset.mgHidden || window.__mgOff) return;
+    el.dataset.mgWhy = why;
+    const fixed = why === "promo";
+    el.dataset.mgHidden = fixed || el.getBoundingClientRect().top >= innerHeight ? "collapsed" : "masked";
   };
   // "Turn on Notifications" and similar nags: MarkGram never shows notifications, so say no.
   const NAG = /turn on notifications|uključi obaveštenja|укључи обавештења|add instagram to your home screen|get the full experience/i;
@@ -94,31 +114,38 @@
     }
   }
 
-  function clean() {
-    dismissNags();
-    for (const el of document.querySelectorAll("article span, article a, article div[role=button], main span, div[role=dialog] span, div[role=dialog] a, a, button")) {
-      if (el.children.length > 2) continue;
-      const t = el.textContent.trim();
-      if (!t || t.length > 30) continue;
-      if (AD_LABEL.test(t)) {
-        const post = el.closest("article");
-        if (post) hide(post, "ad");
-        else if (location.pathname.startsWith("/reels")) skipReel(el);
-      } else if (SUGGESTED.test(t) || PEOPLE.test(t)) {
-        hide(el.closest("article") || block(el), "suggested");
-      } else if (APP_PROMO.test(t)) {
-        // A banner or a dialog asking to open the official app.
-        const dialog = el.closest("div[role=dialog]");
-        if (dialog) {
-          const close = dialog.querySelector('[aria-label="Close" i], [aria-label="Zatvori" i], [aria-label="Затвори" i]');
-          if (close) close.click(); else hide(dialog.parentElement || dialog, "promo");
-        } else {
-          // The "Open app" bar above the tab bar (._acc8): hide the whole bar, not just the
-          // button, or a strip with its close "x" stays behind.
-          hide(el.closest("._acc8") || el.closest("a, button, div[role=button]") || el, "promo");
-        }
+  function check(el) {
+    if (el.children.length > 2) return;
+    const t = el.textContent.trim();
+    if (!t || t.length > 30) return;
+    if (AD_LABEL.test(t)) {
+      // Feed ads are collapsed by the stylesheet above; here only Reels are skipped.
+      if (!el.closest("article") && location.pathname.startsWith("/reels")) skipReel(el);
+    } else if (SUGGESTED.test(t)) {
+      // Suggested posts are left in place: shrinking them confuses Instagram's scrolling.
+    } else if (APP_PROMO.test(t)) {
+      // A banner or a dialog asking to open the official app.
+      const dialog = el.closest("div[role=dialog]");
+      if (dialog) {
+        const close = dialog.querySelector('[aria-label="Close" i], [aria-label="Zatvori" i], [aria-label="Затвори" i]');
+        if (close) close.click(); else hide(dialog.parentElement || dialog, "promo");
+      } else {
+        // The "Open app" bar above the tab bar (._acc8): hide the whole bar, not just the
+        // button, or a strip with its close "x" stays behind.
+        hide(el.closest("._acc8") || el.closest("a, button, div[role=button]") || el, "promo");
       }
     }
+  }
+  const CANDIDATES = "span, a, button, div[role=button]";
+  function clean() {
+    dismissNags();
+    for (const el of document.querySelectorAll(CANDIDATES)) check(el);
+  }
+  /** New nodes are checked right away, while Instagram still keeps them below the screen. */
+  function scan(n) {
+    if (n.nodeType !== 1) return;
+    if (n.matches(CANDIDATES)) check(n);
+    for (const el of n.querySelectorAll(CANDIDATES)) check(el);
   }
   // Logged out: skip the "Open Instagram / Log in / sign up" landing page and go straight to the
   // login form.
@@ -136,18 +163,87 @@
   }
 
   let queued = false;
-  new MutationObserver(() => {
+  new MutationObserver((list) => {
+    try {
+      for (const m of list) {
+        if (m.type === "characterData") { if (m.target.parentElement) check(m.target.parentElement); }
+        else for (const n of m.addedNodes) scan(n);
+      }
+    } catch (e) { }
     if (queued) return;
     queued = true;
-    setTimeout(() => { queued = false; try { if (!skipLanding()) clean(); } catch (e) { } }, 300);
-  }).observe(document.documentElement, { childList: true, subtree: true });
+    setTimeout(() => { queued = false; try { if (!skipLanding()) clean(); } catch (e) { } }, 80);
+  }).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
   if (!skipLanding()) clean();
+
+  // ---- Pull down at the top of the feed to refresh (the website has no pull-to-refresh) ----
+  function setupPullToRefresh(isFeed) {
+    const PULL = 110, MAX = 170;
+    let startY = -1, startX = 0, pulling = false, dist = 0;
+    const box = document.createElement("div");
+    box.style.cssText = "position:fixed;left:50%;top:0;z-index:2147483647;width:44px;height:44px;margin-left:-22px;"
+      + "border-radius:22px;background:#2b2f36;box-shadow:0 2px 8px rgba(0,0,0,.45);display:none;"
+      + "align-items:center;justify-content:center;color:#fff;font:600 22px sans-serif;pointer-events:none;"
+      + "transition:opacity .15s;";
+    box.textContent = "↻";
+    const attach = () => { if (!box.isConnected) (document.body || document.documentElement).appendChild(box); };
+    const show = (d) => {
+      attach();
+      box.style.display = "flex";
+      const p = Math.min(d / PULL, 1);
+      box.style.transform = "translateY(" + Math.round(Math.min(d, MAX) * 0.6) + "px) rotate(" + Math.round(p * 300) + "deg)";
+      box.style.opacity = String(0.35 + p * 0.65);
+      box.style.background = p >= 1 ? "#4f8cff" : "#2b2f36";
+    };
+    const hideBox = () => { box.style.display = "none"; };
+    // Something scrolled inside the page (a comment sheet, a carousel) takes priority.
+    const innerScrolled = (el) => {
+      for (let e = el; e && e !== document.body && e !== document.documentElement; e = e.parentElement) {
+        if (e.scrollTop > 0) return true;
+        if (e.getAttribute && (e.getAttribute("role") === "dialog")) return true;
+      }
+      return false;
+    };
+    document.addEventListener("touchstart", (e) => {
+      pulling = false; dist = 0; startY = -1;
+      if (e.touches.length !== 1 || !isFeed() || window.scrollY > 0 || innerScrolled(e.target)) return;
+      startY = e.touches[0].clientY;
+      startX = e.touches[0].clientX;
+    }, { passive: true, capture: true });
+    document.addEventListener("touchmove", (e) => {
+      if (startY < 0) return;
+      const dy = e.touches[0].clientY - startY, dx = Math.abs(e.touches[0].clientX - startX);
+      if (!pulling) {
+        if (window.scrollY > 0 || dx > Math.abs(dy) || dy < -5) { startY = -1; return; }
+        if (dy < 15) return;
+        pulling = true;
+      }
+      dist = Math.max(0, dy - 15);
+      show(dist);
+    }, { passive: true, capture: true });
+    const end = () => {
+      if (pulling && dist >= PULL) {
+        box.style.transition = "none";
+        box.style.background = "#4f8cff";
+        box.animate([{ transform: box.style.transform }, { transform: box.style.transform + " rotate(720deg)" }],
+          { duration: 900, iterations: Infinity });
+        location.reload();
+      } else {
+        hideBox();
+      }
+      startY = -1; pulling = false; dist = 0;
+    };
+    document.addEventListener("touchend", end, { passive: true, capture: true });
+    document.addEventListener("touchcancel", () => { hideBox(); startY = -1; pulling = false; }, { passive: true, capture: true });
+  }
+
+  setupPullToRefresh(() => location.pathname === "/");
 
   port.onMessage.addListener((msg) => {
     try {
       if (msg.type === "find") find(msg.text);
       else if (msg.type === "html") html(msg.sel, msg.max);
-      else if (msg.type === "hidden") log("hidden: " + [...document.querySelectorAll("[data-mg-hidden]")].map((e) => e.dataset.mgHidden).join(","));
+      else if (msg.type === "hidden") log("hidden: " + [...document.querySelectorAll("[data-mg-hidden]")].map((e) => e.dataset.mgWhy + ":" + e.dataset.mgHidden).join(","));
       else if (msg.type === "css") {
         const sheets = [...document.styleSheets].map((x) => { let n = -1; try { n = x.cssRules.length; } catch (e) { n = "x"; } return (x.href || "inline") .slice(0, 90) + " rules=" + n; });
         const links = [...document.querySelectorAll("link[rel~=stylesheet], link[as=style]")].map((l) => l.href.slice(0, 90) + " " + l.rel);
@@ -180,6 +276,21 @@
         const big = es.filter((e) => /\.jpg/.test(e.name)).sort((a, b) => (b.encodedBodySize || 0) - (a.encodedBodySize || 0))[0];
         if (big) log("bigurl " + big.name);
         log("net " + JSON.stringify(by) + " now=" + Math.round(performance.now()) + " slow: " + slow.join(" ; "));
+      }
+      else if (msg.type === "adcheck") {
+        const ads = [...document.querySelectorAll("article")].filter((a) => a.querySelector("a[href*='facebook.com/ads/'], a[href*='a_mpk=']"));
+        const people = [...document.querySelectorAll("a[href='/explore/people/']")];
+        const sponsoredVisible = [...document.querySelectorAll("span")].filter((x) => x.children.length === 0 && /^(sponsored|ad)$/i.test(x.textContent.trim()) && x.getBoundingClientRect().height > 0 && getComputedStyle(x.closest("article") || x).opacity !== "0");
+        log("adcheck ads=" + ads.length + " heights=" + ads.map((a) => Math.round(a.getBoundingClientRect().height)).join(",")
+          + " people=" + people.map((p) => Math.round(p.getBoundingClientRect().height)).join(",") + " visibleSponsoredLabels=" + sponsoredVisible.length);
+      }
+      else if (msg.type === "adinfo") {
+        for (const a of [...document.querySelectorAll("[data-mg-hidden]")].slice(0, 6)) {
+          const links = [...a.querySelectorAll("a[href]")].map((x) => x.getAttribute("href")).filter((h) => !/^\/[^/]+\/$/.test(h)).slice(0, 6);
+          const lbl = [...a.querySelectorAll("[aria-label]")].map((x) => x.getAttribute("aria-label")).slice(0, 6);
+          const spans = [...a.querySelectorAll("span")].filter((x) => x.children.length === 0).map((x) => x.textContent.trim()).filter((t) => t && t.length < 30).slice(0, 8);
+          log("adinfo " + a.dataset.mgWhy + " tag=" + a.tagName + " links=" + JSON.stringify(links) + " labels=" + JSON.stringify(lbl) + " spans=" + JSON.stringify(spans));
+        }
       }
       else if (msg.type === "at") {
         const els = document.elementsFromPoint(msg.x * innerWidth, msg.y * innerHeight);
