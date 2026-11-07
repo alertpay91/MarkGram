@@ -239,6 +239,291 @@
 
   setupPullToRefresh(() => location.pathname === "/");
 
+  // ---- Download button: saves the photo or video on screen (post, reel or story) ----
+  setupDownload();
+  // Media Instagram's own page has loaded (photos/videos with their file URLs), keyed by id.
+  // Stories play from blob: URLs and their API refuses direct calls, so their file URLs are
+  // taken from the page's own responses.
+  const seenMedia = new Map();
+  function remember(text) {
+    if (!text || (text.indexOf("video_versions") < 0 && text.indexOf("image_versions2") < 0)) return;
+    const walk = (o, depth) => {
+      if (!o || typeof o !== "object" || depth > 40) return;
+      if (Array.isArray(o)) { for (const x of o) walk(x, depth + 1); return; }
+      // A user's story reel: { user: {username}, items: [...] }; the items don't name the user.
+      if (Array.isArray(o.items) && (o.user || o.id)) {
+        for (const it of o.items) {
+          if (!it || typeof it !== "object") continue;
+          if (o.user && o.user.username) it.__owner = o.user.username;
+          if (o.id) it.__reel = String(o.id); // "highlight:123" for highlights
+        }
+      }
+      if ((o.video_versions || o.image_versions2) && (o.pk || o.id)) {
+        const key = String(o.pk || o.id).split("_")[0];
+        seenMedia.delete(key);
+        seenMedia.set(key, o);
+        if (seenMedia.size > 600) seenMedia.delete(seenMedia.keys().next().value);
+      }
+      for (const k in o) if (o[k] && typeof o[k] === "object") walk(o[k], depth + 1);
+    };
+    for (const line of text.replace(/^for \(;;\);/, "").split("\n")) {
+      const t = line.trim();
+      if (!t || (t[0] !== "{" && t[0] !== "[")) continue;
+      try { walk(JSON.parse(t), 0); } catch (e) { }
+    }
+  }
+  try {
+    const W = window.wrappedJSObject;
+    const proto = W.XMLHttpRequest.prototype;
+    const origSend = proto.send;
+    exportFunction(function (body) {
+      const xhr = this;
+      xhr.addEventListener("load", exportFunction(() => {
+        try { if (!xhr.responseType || xhr.responseType === "text") remember(xhr.responseText); } catch (e) { }
+      }, W));
+      return origSend.call(xhr, body);
+    }, proto, { defineAs: "send" });
+    const origFetch = W.fetch;
+    exportFunction(function (input, init) {
+      const p = origFetch.call(W, input, init);
+      try {
+        const url = String(typeof input === "string" ? input : input && input.url || "");
+        if (/graphql|\/api\//.test(url)) {
+          p.then(exportFunction((r) => {
+            try { r.clone().text().then(exportFunction((t) => { try { remember(t); } catch (e) { } }, W)); } catch (e) { }
+          }, W));
+        }
+      } catch (e) { }
+      return p;
+    }, W, { defineAs: "fetch" });
+  } catch (e) {
+    log("media hook failed " + e);
+  }
+
+  function setupDownload() {
+    const ABC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const mediaId = (code) => {
+      let id = 0n;
+      for (const c of code.slice(0, 11)) id = id * 64n + BigInt(ABC.indexOf(c));
+      return id.toString();
+    };
+    const CODE_RE = /\/(?:p|reel|reels|tv)\/([A-Za-z0-9_-]{6,})/;
+    const pageKind = () => {
+      const p = location.pathname;
+      if (p === "/") return "feed";
+      if (/^\/stories\/[^/]+/.test(p)) return "story";
+      if (CODE_RE.test(p)) return "post";
+      return null;
+    };
+    // The post nearest the middle of the screen in the feed.
+    const centerArticle = () => {
+      let best = null, dist = 1e9;
+      for (const a of document.querySelectorAll("article")) {
+        const r = a.getBoundingClientRect();
+        if (r.bottom < 0 || r.top > innerHeight || r.height < 50) continue;
+        const d = r.top <= innerHeight / 2 && r.bottom >= innerHeight / 2 ? 0 : Math.min(Math.abs(r.top - innerHeight / 2), Math.abs(r.bottom - innerHeight / 2));
+        if (d < dist) { dist = d; best = a; }
+      }
+      return best;
+    };
+    const codeIn = (el) => {
+      for (const a of el.querySelectorAll("a[href]")) {
+        const m = CODE_RE.exec(a.getAttribute("href"));
+        if (m) return m[1];
+      }
+      return null;
+    };
+    // Carousels: the dots under the photos, one of which looks different (the current one).
+    const carouselIndex = (root, n) => {
+      if (!root) return -1;
+      for (const box of root.querySelectorAll("div")) {
+        if (box.children.length !== n) continue;
+        const kids = [...box.children];
+        if (!kids.every((k) => { const r = k.getBoundingClientRect(); return r.width > 0 && r.width <= 12 && r.height <= 12; })) continue;
+        const counts = {};
+        for (const k of kids) counts[k.className] = (counts[k.className] || 0) + 1;
+        const odd = kids.findIndex((k) => counts[k.className] === 1);
+        if (odd >= 0) return odd;
+      }
+      return -1;
+    };
+    const best = (item) => {
+      if (item.video_versions && item.video_versions.length) {
+        const v = item.video_versions.slice().sort((a, b) => (b.width || 0) - (a.width || 0))[0];
+        return { url: v.url, video: true };
+      }
+      const c = item.image_versions2 && item.image_versions2.candidates || [];
+      const i = c.slice().sort((a, b) => (b.width || 0) - (a.width || 0))[0];
+      return i ? { url: i.url, video: false } : null;
+    };
+
+    // The same headers Instagram's own page sends with its API calls.
+    const apiHeaders = () => {
+      const h = { "X-IG-App-ID": "936619743392459", "X-Requested-With": "XMLHttpRequest", "X-ASBD-ID": "129477" };
+      const csrf = /(?:^|;\s*)csrftoken=([^;]+)/.exec(document.cookie);
+      if (csrf) h["X-CSRFToken"] = csrf[1];
+      try { const c = sessionStorage.getItem("www-claim-v2"); if (c) h["X-IG-WWW-Claim"] = c; } catch (e) { }
+      return h;
+    };
+    const api = async (path) => {
+      const r = await content.fetch("https://www.instagram.com" + path,
+        cloneInto({ credentials: "include", headers: apiHeaders() }, window));
+      if (!r.ok) throw new Error("HTTP " + r.status + " " + path);
+      return JSON.parse(await r.text());
+    };
+    // File name of a CDN URL ("…/12345_n.jpg"): the same for every size of one photo or video.
+    const fileOf = (u) => { try { return new URL(u, location.href).pathname.split("/").pop(); } catch (e) { return ""; } };
+    // Fallback for stories: the video or picture element on screen, when it has a real file URL.
+    function storyFromPage() {
+      const media = [...document.querySelectorAll("video, img")].map((e) => ({ e, r: e.getBoundingClientRect() }))
+        .filter((x) => x.r.width > innerWidth * 0.6 && x.r.height > innerHeight * 0.4 && x.r.top < innerHeight && x.r.bottom > 0)
+        .sort((a, b) => b.r.width * b.r.height - a.r.width * a.r.height);
+      const v = media.find((x) => x.e.tagName === "VIDEO");
+      if (v) {
+        const src = v.e.currentSrc || v.e.src || (v.e.querySelector("source") || {}).src || "";
+        if (src && !src.startsWith("blob:")) return { video_versions: [{ url: src, width: 1 }], pk: "story" + Date.now() };
+        return null;
+      }
+      const im = media.find((x) => x.e.tagName === "IMG");
+      if (!im) return null;
+      let url = im.e.currentSrc || im.e.src, w = 0;
+      for (const part of (im.e.srcset || "").split(",")) {
+        const [u, d] = part.trim().split(/\s+/);
+        const n = parseInt(d, 10) || 0;
+        if (u && n > w) { w = n; url = u; }
+      }
+      return { image_versions2: { candidates: [{ url, width: w }] }, pk: "story" + Date.now() };
+    }
+    // Stories: the URL names the user and, once a story has played, its id. The media API
+    // answers for an id; otherwise the story is picked from what the page itself loaded for
+    // that user (by its file, or by the progress bars). Direct story API calls are refused.
+    async function storyItem() {
+      const m = /^\/stories\/([^/]+)\/(\d+)?/.exec(location.pathname);
+      if (m[1] !== "highlights" && m[2]) {
+        try {
+          const d = await api("/api/v1/media/" + m[2] + "/info/");
+          if (d.items && d.items[0]) return d.items[0];
+        } catch (e) { log("story by id: " + e); }
+      }
+      const own = [...seenMedia.values()].filter((o) => m[1] === "highlights"
+        ? o.__reel === "highlight:" + m[2]
+        : (o.expiring_at || o.product_type === "story") && ((o.user && o.user.username) || o.__owner) === m[1])
+        .sort((a, b) => (a.taken_at || 0) - (b.taken_at || 0));
+      return own.length ? pickStory(own) : null;
+    }
+
+    // Which of a user's stories is on screen.
+    function pickStory(items) {
+      // What is on screen: the biggest visible video or picture.
+      const media = [...document.querySelectorAll("video, img")].map((e) => ({ e, r: e.getBoundingClientRect() }))
+        .filter((x) => x.r.width > innerWidth * 0.6 && x.r.height > innerHeight * 0.4)
+        .sort((a, b) => b.r.width * b.r.height - a.r.width * a.r.height);
+      const names = new Set();
+      for (const x of media) {
+        const src = x.e.currentSrc || x.e.src || "";
+        if (src && !src.startsWith("blob:")) names.add(fileOf(src));
+        if (x.e.poster) names.add(fileOf(x.e.poster));
+      }
+      const hit = items.find((it) => {
+        const urls = [...(it.video_versions || []), ...((it.image_versions2 && it.image_versions2.candidates) || [])].map((v) => fileOf(v.url));
+        return urls.some((u) => names.has(u));
+      });
+      if (hit) return hit;
+      // Progress bars at the top: one per story; finished ones are full, the current one partly.
+      for (const box of document.querySelectorAll("div")) {
+        if (box.children.length !== items.length) continue;
+        const r = box.getBoundingClientRect();
+        if (r.top > innerHeight * 0.25 || r.width < innerWidth * 0.5) continue;
+        const kids = [...box.children];
+        if (!kids.every((k) => { const kr = k.getBoundingClientRect(); return kr.height > 0 && kr.height <= 6; })) continue;
+        const fill = kids.map((k) => {
+          const inner = k.querySelector("div");
+          return inner ? inner.getBoundingClientRect().width / Math.max(1, k.getBoundingClientRect().width) : 0;
+        });
+        let i = fill.findIndex((f) => f < 0.99);
+        if (i < 0) i = items.length - 1;
+        return items[i];
+      }
+      return items.length === 1 ? items[0] : null;
+    }
+
+    const btn = document.createElement("div");
+    btn.style.cssText = "position:fixed;right:8px;top:42%;z-index:2147483646;width:42px;height:42px;border-radius:21px;"
+      + "background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;"
+      + "box-shadow:0 1px 4px rgba(0,0,0,.4);-webkit-tap-highlight-color:transparent;";
+    btn.innerHTML = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" '
+      + 'stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>';
+    for (const t of ["touchstart", "touchend", "pointerdown", "pointerup", "mousedown", "mouseup", "click"]) {
+      btn.addEventListener(t, (e) => {
+        e.stopPropagation();
+        if (t === "click") { e.preventDefault(); download(); }
+      }, { passive: false });
+    }
+    let busy = false;
+    const flash = (ok) => {
+      btn.style.background = ok ? "rgba(46,160,67,.85)" : "rgba(200,50,50,.85)";
+      setTimeout(() => { btn.style.background = "rgba(0,0,0,.45)"; }, 900);
+    };
+    async function download() {
+      if (busy) return;
+      const kind = pageKind();
+      let id = null, code = null, root = null;
+      if (kind === "post") {
+        code = CODE_RE.exec(location.pathname)[1];
+        // Reels: the URL follows the reel on screen. A /p/ page shows one post.
+        root = document.querySelector("article") || document.querySelector("main");
+      } else if (kind === "feed") {
+        root = centerArticle();
+        code = root && codeIn(root);
+      }
+      if (code) id = mediaId(code);
+      if (kind !== "story" && !id) { log("download: nothing on screen"); flash(false); return; }
+      busy = true;
+      btn.style.opacity = "0.6";
+      try {
+        let item;
+        if (kind === "story") {
+          try { item = await storyItem(); } catch (e) { log("story api: " + e); }
+          if (!item) item = storyFromPage();
+          if (!item) throw new Error("story on screen not found");
+          code = String(item.pk || item.id || "story").split("_")[0];
+        } else {
+          const data = await api("/api/v1/media/" + id + "/info/");
+          item = data.items && data.items[0];
+        }
+        if (!item) throw new Error("no item");
+        let parts = item.carousel_media && item.carousel_media.length ? item.carousel_media : [item];
+        if (parts.length > 1) {
+          const i = carouselIndex(root, parts.length);
+          if (i >= 0) parts = [parts[i]];
+        }
+        const files = [];
+        parts.forEach((p, i) => {
+          const b = best(p);
+          if (b) files.push({ url: b.url, video: b.video, name: "markgram_" + code + (parts.length > 1 ? "_" + (i + 1) : "") });
+        });
+        if (!files.length) throw new Error("no media urls");
+        port.postMessage({ type: "download", files });
+        log("download " + files.length + " file(s) for " + code);
+        flash(true);
+      } catch (e) {
+        log("download failed " + e);
+        flash(false);
+      } finally {
+        busy = false;
+        btn.style.opacity = "1";
+      }
+    }
+    const update = () => {
+      const kind = pageKind();
+      const show = kind === "post" || kind === "story" || (kind === "feed" && !!centerArticle());
+      if (show && !btn.isConnected) document.documentElement.appendChild(btn);
+      btn.style.display = show ? "flex" : "none";
+    };
+    setInterval(() => { if (document.visibilityState === "visible") update(); }, 700);
+    update();
+  }
+
   port.onMessage.addListener((msg) => {
     try {
       if (msg.type === "find") find(msg.text);

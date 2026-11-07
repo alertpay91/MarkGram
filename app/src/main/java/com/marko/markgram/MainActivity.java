@@ -6,11 +6,13 @@ import android.content.ActivityNotFoundException;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.MediaStore;
+import android.provider.OpenableColumns;
 import android.util.Log;
 import android.view.View;
 import android.view.WindowInsets;
@@ -27,6 +29,8 @@ import org.mozilla.geckoview.GeckoSession.PromptDelegate;
 import org.mozilla.geckoview.GeckoView;
 import org.mozilla.geckoview.WebResponse;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
@@ -66,6 +70,8 @@ public class MainActivity extends Activity {
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT));
         root.setBackgroundColor(0xFF000000);
+        // Black instead of Gecko's white blank page until Instagram paints.
+        geckoView.coverUntilFirstPaint(0xFF000000);
         setContentView(root);
         applyInsets();
         attachSession();
@@ -90,6 +96,75 @@ public class MainActivity extends Activity {
             geckoView.setSession(s);
         }
         s.setActive(true);
+        App.setPageListener(this::onPageMessage);
+    }
+
+    private void onPageMessage(org.json.JSONObject msg) {
+        if ("download".equals(msg.optString("type"))) saveMedia(msg.optJSONArray("files"));
+    }
+
+    // ---- Download button: photos go to Pictures/MarkGram, videos to Movies/MarkGram ----
+
+    private void saveMedia(org.json.JSONArray files) {
+        if (files == null || files.length() == 0) return;
+        if (Build.VERSION.SDK_INT < 29) {
+            Toast.makeText(this, "Preuzimanje traži Android 10 ili noviji", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final android.content.Context ctx = getApplicationContext();
+        Toast.makeText(this, files.length() > 1 ? "Preuzimam " + files.length() + " fajla…" : "Preuzimam…",
+                Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            int ok = 0;
+            boolean anyVideo = false;
+            for (int i = 0; i < files.length(); i++) {
+                org.json.JSONObject f = files.optJSONObject(i);
+                if (f == null) continue;
+                boolean video = f.optBoolean("video");
+                anyVideo |= video;
+                String name = f.optString("name", "markgram") + (video ? ".mp4" : ".jpg");
+                Uri out = null;
+                try {
+                    java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(f.getString("url")).openConnection();
+                    c.setConnectTimeout(15000);
+                    c.setReadTimeout(30000);
+                    if (c.getResponseCode() != 200) throw new java.io.IOException("HTTP " + c.getResponseCode());
+                    String type = c.getContentType();
+                    if (type == null || !type.contains("/")) type = video ? "video/mp4" : "image/jpeg";
+                    type = type.split(";")[0].trim();
+                    if (type.equals("image/webp")) name = name.replaceAll("\\.jpg$", ".webp");
+                    ContentValues v = new ContentValues();
+                    v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                    v.put(MediaStore.MediaColumns.MIME_TYPE, type);
+                    v.put(MediaStore.MediaColumns.RELATIVE_PATH,
+                            (video ? Environment.DIRECTORY_MOVIES : Environment.DIRECTORY_PICTURES) + "/MarkGram");
+                    v.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                    Uri collection = video
+                            ? MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                            : MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+                    out = ctx.getContentResolver().insert(collection, v);
+                    if (out == null) throw new java.io.IOException("insert failed");
+                    try (InputStream in = c.getInputStream(); OutputStream os = ctx.getContentResolver().openOutputStream(out)) {
+                        byte[] buf = new byte[64 * 1024];
+                        for (int n; (n = in.read(buf)) > 0; ) os.write(buf, 0, n);
+                    }
+                    ContentValues done = new ContentValues();
+                    done.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                    ctx.getContentResolver().update(out, done, null, null);
+                    ok++;
+                } catch (Exception e) {
+                    Log.w(App.TAG, "media download failed", e);
+                    if (out != null) {
+                        try { ctx.getContentResolver().delete(out, null, null); } catch (Exception ignored) { }
+                    }
+                }
+            }
+            final int saved = ok, total = files.length();
+            final String where = anyVideo ? "galeriju (Movies/MarkGram)" : "galeriju (Pictures/MarkGram)";
+            runOnUiThread(() -> Toast.makeText(ctx,
+                    saved == total ? "Sačuvano u " + where : saved > 0 ? "Sačuvano " + saved + " od " + total : "Preuzimanje nije uspelo",
+                    Toast.LENGTH_SHORT).show());
+        }, "media-download").start();
     }
 
     @Override
@@ -481,11 +556,47 @@ public class MainActivity extends Activity {
         }
         if (uris.isEmpty()) {
             r.complete(p.dismiss());
-        } else if (p.type == PromptDelegate.FilePrompt.Type.MULTIPLE) {
-            r.complete(p.confirm(this, uris.toArray(new Uri[0])));
-        } else {
-            r.complete(p.confirm(this, uris.get(0)));
+            return;
         }
+        // Gecko can't open content:// URIs from the picker on every site (Instagram DMs and the Facebook inbox
+        // fails with "Unrecognized path"), so the files are copied into the app's cache first
+        // and handed over as plain files.
+        new Thread(() -> {
+            File dir = new File(getCacheDir(), "uploads");
+            File[] old = dir.listFiles();
+            if (old != null) for (File f : old) f.delete();
+            dir.mkdirs();
+            List<Uri> files = new ArrayList<>();
+            for (int i = 0; i < uris.size(); i++) {
+                Uri u = uris.get(i);
+                File f = new File(dir, i + "_" + displayName(u));
+                try (InputStream in = getContentResolver().openInputStream(u);
+                     OutputStream out = new FileOutputStream(f)) {
+                    if (in == null) continue;
+                    byte[] buf = new byte[64 * 1024];
+                    for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);
+                    files.add(Uri.fromFile(f));
+                } catch (Exception e) {
+                    Log.w(App.TAG, "copy upload failed", e);
+                }
+            }
+            runOnUiThread(() -> {
+                if (files.isEmpty()) r.complete(p.dismiss());
+                else if (p.type == PromptDelegate.FilePrompt.Type.MULTIPLE)
+                    r.complete(p.confirm(this, files.toArray(new Uri[0])));
+                else r.complete(p.confirm(this, files.get(0)));
+            });
+        }).start();
+    }
+
+    private String displayName(Uri u) {
+        String name = null;
+        try (Cursor c = getContentResolver().query(u, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst()) name = c.getString(0);
+        } catch (Exception ignored) {
+        }
+        if (name == null || name.isEmpty()) name = "file";
+        return name.replaceAll("[\\/:*?\"<>|]", "_");
     }
 
     // ---- No notifications, location, camera or microphone; no autoplay with sound ----

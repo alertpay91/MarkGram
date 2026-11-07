@@ -50,6 +50,9 @@ pretraga.
 
 - **Dugme nazad:** vraća jedan korak, na primer iz razgovora, story-ja ili objave. Sa početnog
   feed-a izlazi iz aplikacije, kao prava Instagram aplikacija.
+- **Preuzimanje:** okruglo dugme ⬇ na desnoj strani čuva sliku ili video koji gledaš (objava,
+  Reels ili story) u punoj veličini, u galeriju: slike u *Pictures/MarkGram*, video u
+  *Movies/MarkGram*. Kod objave sa više slika čuva onu koja se trenutno vidi.
 - **Prvo pokretanje** posle instalacije može da potraje desetak sekundi, dok se Instagram ne
   učita.
 
@@ -65,6 +68,9 @@ pretraga.
 - ads and sponsored posts; sponsored Reels are skipped;
 - suggestion blocks;
 - "Open app" prompts and "Turn on Notifications" nags.
+
+**Download button:** the round ⬇ button on the right saves the photo or video on screen (post,
+Reel or story) at full size to the gallery: *Pictures/MarkGram* and *Movies/MarkGram*.
 
 When you're logged out, it opens the login form directly.
 

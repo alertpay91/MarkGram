@@ -129,9 +129,12 @@ public class App extends Application {
                 p.setDelegate(new WebExtension.PortDelegate() {
                     @Override
                     public void onPortMessage(Object message, WebExtension.Port from) {
-                        if (message instanceof JSONObject
-                                && "log".equals(((JSONObject) message).optString("type"))) {
-                            Log.i(TAG, "page: " + ((JSONObject) message).optString("text"));
+                        if (!(message instanceof JSONObject)) return;
+                        JSONObject msg = (JSONObject) message;
+                        if ("log".equals(msg.optString("type"))) {
+                            Log.i(TAG, "page: " + msg.optString("text"));
+                        } else if (pageListener != null) {
+                            pageListener.accept(msg);
                         }
                     }
 
@@ -142,6 +145,13 @@ public class App extends Application {
                 });
             }
         }, "markgram");
+    }
+
+    private static java.util.function.Consumer<JSONObject> pageListener;
+
+    /** Messages from the page helper other than logs (e.g. "download"), on the UI thread. */
+    static void setPageListener(java.util.function.Consumer<JSONObject> l) {
+        pageListener = l;
     }
 
     /** Debug aid: sends a JSON command to the page helper (results show up in the log). */
