@@ -132,7 +132,11 @@ public class MainActivity extends Activity {
                     String type = c.getContentType();
                     if (type == null || !type.contains("/")) type = video ? "video/mp4" : "image/jpeg";
                     type = type.split(";")[0].trim();
-                    if (type.equals("image/webp")) name = name.replaceAll("\\.jpg$", ".webp");
+                    if (!video) {
+                        String ext = type.equals("image/webp") ? ".webp" : type.equals("image/png") ? ".png"
+                                : type.equals("image/avif") ? ".avif" : type.equals("image/gif") ? ".gif" : ".jpg";
+                        name = name.replaceAll("\\.jpg$", ext);
+                    }
                     ContentValues v = new ContentValues();
                     v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
                     v.put(MediaStore.MediaColumns.MIME_TYPE, type);
