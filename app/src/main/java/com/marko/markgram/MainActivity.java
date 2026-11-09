@@ -636,6 +636,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onStart() {
         super.onStart();
+        UpdateBanner.check(this, root); // "new version" bar, only while the app is open
         if (owner != this && session != null) {
             // Another copy took the tab over; take it back now that this one is on screen.
             attachSession();
