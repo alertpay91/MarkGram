@@ -246,6 +246,7 @@
   // taken from the page's own responses.
   const seenMedia = new Map();
   function remember(text) {
+    if (text && text.indexOf("xdt_activity_inbox") >= 0) rememberNotifications(text);
     if (!text || (text.indexOf("video_versions") < 0 && text.indexOf("image_versions2") < 0)) return;
     const walk = (o, depth) => {
       if (!o || typeof o !== "object" || depth > 40) return;
@@ -272,6 +273,110 @@
       try { walk(JSON.parse(t), 0); } catch (e) { }
     }
   }
+  // ---- Notifications: open the post / reel / comment a notification is about ----
+  // The rows on /notifications/ carry no link to the post. Instagram's own tap handler goes to
+  // the "destination" of the item (e.g. clips_home?id=..&target_comment_id=..), which the
+  // mobile site can't open, so nothing happens. The page's own inbox response names the
+  // media's shortcode; rows are matched to it by the thumbnail's file name.
+  const notifByThumb = new Map();
+  const fileKey = (u) => { try { return new URL(u, location.href).pathname.split("/").pop(); } catch (e) { return ""; } };
+  function rememberNotifications(text) {
+    const walk = (o, depth) => {
+      if (!o || typeof o !== "object" || depth > 30) return;
+      if (Array.isArray(o)) { for (const x of o) walk(x, depth + 1); return; }
+      const args = o.args;
+      if (args && typeof args === "object") {
+        const medias = [].concat(args.media || [], args.medias || []);
+        const dest = String(args.destination || "");
+        const comment = /(?:target_comment_id|comment_id)=(\d+)/.exec(dest);
+        const reel = /^clips|reel/i.test(dest);
+        for (const m of medias) {
+          if (!m || !m.shortcode) continue;
+          const img = m.image && (m.image.url || m.image.uri) || m.image_url || m.thumbnail_url || "";
+          const key = fileKey(img);
+          if (key) notifByThumb.set(key, { code: m.shortcode, comment: comment && comment[1], reel });
+        }
+      }
+      for (const k in o) if (o[k] && typeof o[k] === "object") walk(o[k], depth + 1);
+    };
+    for (const line of text.replace(/^for \(;;\);/, "").split("\n")) {
+      const t = line.trim();
+      if (!t || (t[0] !== "{" && t[0] !== "[")) continue;
+      try { walk(JSON.parse(t), 0); } catch (e) { }
+    }
+    if (notifByThumb.size > 1000) notifByThumb.delete(notifByThumb.keys().next().value);
+  }
+  document.addEventListener("click", (e) => {
+    if (!location.pathname.startsWith("/notifications")) return;
+    const t = e.target;
+    // Leave user names, buttons (Follow, Confirm, "more") and real links to Instagram.
+    if (!t || !t.closest || t.closest("a[href], [role=button], button")) return;
+    const row = t.closest("[data-pressable-container]");
+    if (!row) return;
+    const lookup = () => {
+      for (const img of row.querySelectorAll("img")) {
+        const h = notifByThumb.get(fileKey(img.currentSrc || img.src));
+        if (h) return h;
+      }
+      return null;
+    };
+    let hit = lookup();
+    if (!hit) {
+      // On a full page load the inbox comes embedded in the HTML instead of an XHR.
+      for (const sc of document.querySelectorAll("script[type='application/json']")) {
+        const txt = sc.textContent || "";
+        if (txt.indexOf("xdt_activity_inbox") >= 0) rememberNotifications(txt);
+      }
+      hit = lookup();
+    }
+    if (!hit) log("notification: no post found for this row (" + notifByThumb.size + " known)");
+    if (!hit) return;
+    const before = location.href;
+    const target = "/" + (hit.reel ? "reel" : "p") + "/" + hit.code + "/" + (hit.comment ? "c/" + hit.comment + "/" : "");
+    // Give Instagram a moment in case its own handler does work for this kind of item.
+    // "... liked your comment: <start of the comment>..." - find that comment on the next page.
+    const said = /(?:comment|komentar|коментар)[^:]{0,20}:\s*(.+)/i.exec(row.innerText || "");
+    setTimeout(() => {
+      if (location.href !== before) return;
+      log("notification -> " + target);
+      try {
+        if (said) sessionStorage.setItem("mgFindComment", JSON.stringify({ text: said[1], at: Date.now() }));
+      } catch (e) { }
+      location.assign(target);
+    }, 400);
+  }, true);
+
+  // On the comments page opened from a notification: scroll to that comment and mark it.
+  (() => {
+    let want = null;
+    try {
+      want = JSON.parse(sessionStorage.getItem("mgFindComment") || "null");
+      sessionStorage.removeItem("mgFindComment");
+    } catch (e) { }
+    if (!want || Date.now() - want.at > 30000) return;
+    const norm = (s) => s.replace(/\s+/g, " ").trim().toLowerCase();
+    // Drop the "... more" / date tail of the notification text and keep a solid prefix.
+    const needle = norm(want.text.replace(/(\.\.\.|…)[\s\S]*$/, "").replace(/\s+more\b[\s\S]*$/i, "")).slice(0, 40);
+    if (needle.length < 4) return;
+    let tries = 0;
+    const timer = setInterval(() => {
+      if (++tries > 30) { clearInterval(timer); return; }
+      for (const span of document.querySelectorAll("main span[dir=auto], span[dir=auto]")) {
+        if (span.querySelector("span[dir=auto]")) continue;
+        if (!norm(span.textContent || "").startsWith(needle)) continue;
+        clearInterval(timer);
+        const box = span.closest("li, [role=listitem]") || span.parentElement.parentElement || span;
+        box.scrollIntoView({ block: "center" });
+        box.style.transition = "background-color 0.6s";
+        box.style.backgroundColor = "rgba(0,149,246,0.25)";
+        setTimeout(() => { box.style.backgroundColor = ""; }, 2500);
+        return;
+      }
+      // Not loaded yet: scroll down so Instagram loads more comments.
+      if (tries % 3 === 0) window.scrollBy(0, window.innerHeight);
+    }, 700);
+  })();
+
   try {
     const W = window.wrappedJSObject;
     const proto = W.XMLHttpRequest.prototype;
