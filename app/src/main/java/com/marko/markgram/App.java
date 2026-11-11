@@ -32,12 +32,16 @@ public class App extends Application {
     private static WebExtension helper;
     private static WebExtension.Port port;
 
+    private static Context appCtx;
+    private static final android.os.Handler MAIN = new android.os.Handler(android.os.Looper.getMainLooper());
+
     static GeckoRuntime runtime(Context ctx) {
         if (runtime == null) {
             GeckoRuntimeSettings settings = new GeckoRuntimeSettings.Builder()
                     .consoleOutput(false)
                     .loginAutofillEnabled(false)
                     .build();
+            appCtx = ctx.getApplicationContext();
             runtime = GeckoRuntime.create(ctx.getApplicationContext(), settings);
             setupExtensions(runtime);
         }
@@ -102,11 +106,24 @@ public class App extends Application {
 
         controller.list().accept(installed -> {
             Set<String> ids = new HashSet<>();
+            // Checking the add-ons for updates on every start competed with the page's first
+            // load (slower start); once a day is plenty.
+            android.content.SharedPreferences prefs =
+                    appCtx.getSharedPreferences("app", Context.MODE_PRIVATE);
+            boolean checkUpdates = System.currentTimeMillis() - prefs.getLong("extUpdate", 0) > 24L * 3600 * 1000;
+            if (checkUpdates) prefs.edit().putLong("extUpdate", System.currentTimeMillis()).apply();
             if (installed != null) {
                 for (WebExtension ext : installed) {
                     ids.add(ext.id);
                     Log.i(TAG, "extension installed: " + ext.id + " enabled=" + ext.metaData.enabled);
-                    controller.update(ext).accept(null, e -> Log.w(TAG, "update failed " + ext.id, e));
+                    if (!ext.isBuiltIn && !ext.metaData.enabled) {
+                        controller.enable(ext, WebExtensionController.EnableSource.USER);
+                    }
+                    if (checkUpdates && !ext.isBuiltIn) {
+                        // Later, when the page has loaded.
+                        MAIN.postDelayed(() -> controller.update(ext)
+                                .accept(null, e -> Log.w(TAG, "update failed " + ext.id, e)), 20000);
+                    }
                 }
             }
             for (String[] e : EXTENSIONS) {
