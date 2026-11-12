@@ -629,6 +629,37 @@
     update();
   }
 
+  // No autoplay in the feed: a video that starts without a tap in the last seconds is paused
+  // again (feed videos playing by themselves cost 160-220% of a core on a Pixel 8). Reels,
+  // stories and an opened post keep playing by themselves, as in MarkBook.
+  const AUTOPLAY_OK = /^\/(reels?|stories|p|tv)\//;
+  const noAutoplay = (v) => {
+    if (!v || !v.pause || (navigator.userActivation && navigator.userActivation.isActive)) return;
+    if (AUTOPLAY_OK.test(location.pathname)) return;
+    v.pause();
+  };
+  document.addEventListener("play", (e) => noAutoplay(e.target), true);
+  document.addEventListener("playing", (e) => noAutoplay(e.target), true);
+  for (const v of document.querySelectorAll("video")) if (!v.paused) noAutoplay(v);
+
+  // Animations far off screen keep running (Instagram's "loading more" spinner thousands of
+  // pixels below the last post). Freeze each one while it is off screen.
+  const offStyle = document.createElement("style");
+  offStyle.textContent = ".mg-offscreen, .mg-offscreen * { animation-play-state: paused !important; }";
+  (document.head || document.documentElement).appendChild(offStyle);
+  const offIO = new IntersectionObserver((entries) => {
+    for (const e of entries) e.target.classList.toggle("mg-offscreen", !e.isIntersecting);
+  }, { rootMargin: "200px" });
+  const offSeen = new WeakSet();
+  setInterval(() => {
+    if (document.visibilityState !== "visible") return;
+    for (const a of document.getAnimations()) {
+      const t = a.effect && a.effect.target;
+      if (t && t.nodeType === 1 && !offSeen.has(t)) { offSeen.add(t); offIO.observe(t); }
+    }
+  }, 2000);
+
+
   port.onMessage.addListener((msg) => {
     try {
       if (msg.type === "find") find(msg.text);
