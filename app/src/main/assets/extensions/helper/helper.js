@@ -651,9 +651,21 @@
     for (const e of entries) e.target.classList.toggle("mg-offscreen", !e.isIntersecting);
   }, { rootMargin: "200px" });
   const offSeen = new WeakSet();
+  // The floating "reposted by" avatars on posts drift a few pixels forever (8 s translate loop);
+  // each one keeps the GPU process at ~100% of a core while on screen. Stop such endless
+  // drifts on their first frame (looks the same, just still); spinners rotate and are kept.
+  const isDrift = (a) => {
+    try {
+      if (a.playState !== "running" || a.effect.getComputedTiming().iterations !== Infinity) return false;
+      const kf = a.effect.getKeyframes();
+      return kf.length > 1 && kf.every((k) => !k.transform || /^translate/.test(k.transform))
+        && kf.some((k) => k.transform) && kf.every((k) => k.opacity === undefined);
+    } catch (e) { return false; }
+  };
   setInterval(() => {
     if (document.visibilityState !== "visible") return;
     for (const a of document.getAnimations()) {
+      if (isDrift(a)) { a.pause(); a.currentTime = 0; continue; }
       const t = a.effect && a.effect.target;
       if (t && t.nodeType === 1 && !offSeen.has(t)) { offSeen.add(t); offIO.observe(t); }
     }
